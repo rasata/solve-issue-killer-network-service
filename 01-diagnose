@@ -1,0 +1,420 @@
+# Script de diagnostic interactif des services
+# Désactive les services groupe par groupe jusqu'à trouver le problème
+
+param(
+    [Parameter(Mandatory=$false)]
+    [ValidateSet("capture", "interactive")]
+    [string]$Mode = "interactive",
+    
+    [Parameter(Mandatory=$false)]
+    [int]$GroupSize = 20,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$LogPath = "C:\Temp\ServiceDiagnostic"
+)
+
+# Vérification des privilèges administrateur
+if (-NOT ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
+    Write-Error "Ce script doit être exécuté en tant qu'administrateur!"
+    Write-Host "Clic droit sur PowerShell -> Exécuter en tant qu'administrateur" -ForegroundColor Yellow
+    Read-Host "Appuyez sur Entrée pour quitter"
+    exit
+}
+
+# Création du dossier de logs
+if (!(Test-Path $LogPath)) {
+    New-Item -ItemType Directory -Path $LogPath -Force
+}
+
+$SafeModeServicesFile = "$LogPath\SafeModeServices.json"
+$NormalModeServicesFile = "$LogPath\NormalModeServices.json"
+$DiagnosticLogFile = "$LogPath\DiagnosticLog.txt"
+
+# Fonction pour obtenir les services en cours d'exécution
+function Get-RunningServices {
+    return Get-Service | Where-Object {$_.Status -eq "Running"} | Select-Object Name, DisplayName, StartType
+}
+
+# Fonction pour écrire dans le log
+function Write-Log {
+    param([string]$Message)
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    "$timestamp - $Message" | Out-File -FilePath $DiagnosticLogFile -Append
+    Write-Host $Message
+}
+
+# Fonction pour demander confirmation à l'utilisateur
+function Ask-User {
+    param([string]$Question)
+    
+    do {
+        Write-Host "`n$Question" -ForegroundColor Cyan
+        Write-Host "[O]ui / [N]on / [A]rrêter le diagnostic" -ForegroundColor Yellow
+        $response = Read-Host "Votre choix"
+        $response = $response.ToUpper().Trim()
+        
+        if ($response -eq "A" -or $response -eq "ARRETER") {
+            Write-Host "Diagnostic arrêté par l'utilisateur." -ForegroundColor Red
+            return "STOP"
+        }
+        
+        if ($response -eq "O" -or $response -eq "OUI") {
+            return $true
+        }
+        
+        if ($response -eq "N" -or $response -eq "NON") {
+            return $false
+        }
+        
+        Write-Host "Réponse non reconnue. Utilisez O/Oui, N/Non ou A/Arrêter" -ForegroundColor Red
+        
+    } while ($true)
+}
+
+# Fonction pour afficher les services d'un groupe
+function Show-ServiceGroup {
+    param([array]$Services, [int]$GroupNumber, [int]$TotalGroups)
+    
+    Write-Host "`n=== GROUPE $GroupNumber/$TotalGroups ===" -ForegroundColor Green
+    Write-Host "Services qui vont être désactivés:" -ForegroundColor Yellow
+    foreach ($service in $Services) {
+        Write-Host "  - $($service.DisplayName) ($($service.Name))" -ForegroundColor White
+    }
+}
+
+# Fonction pour désactiver un groupe de services
+function Disable-ServiceGroup {
+    param([array]$Services)
+    
+    $disabledServices = @()
+    foreach ($service in $Services) {
+        try {
+            $svc = Get-Service -Name $service.Name -ErrorAction SilentlyContinue
+            if ($svc -and $svc.Status -eq "Running") {
+                Write-Host "  Arrêt de: $($service.DisplayName)" -ForegroundColor Gray
+                Stop-Service -Name $service.Name -Force -ErrorAction SilentlyContinue
+                $disabledServices += $service
+                Write-Log "Service arrêté: $($service.DisplayName) ($($service.Name))"
+            }
+        } catch {
+            Write-Warning "Impossible d'arrêter: $($service.DisplayName) - $($_.Exception.Message)"
+            Write-Log "ERREUR - Impossible d'arrêter: $($service.DisplayName) - $($_.Exception.Message)"
+        }
+    }
+    return $disabledServices
+}
+
+# Fonction pour réactiver un groupe de services
+function Enable-ServiceGroup {
+    param([array]$Services)
+    
+    foreach ($service in $Services) {
+        try {
+            $svc = Get-Service -Name $service.Name -ErrorAction SilentlyContinue
+            if ($svc -and $svc.Status -eq "Stopped") {
+                Write-Host "  Redémarrage de: $($service.DisplayName)" -ForegroundColor Gray
+                Start-Service -Name $service.Name -ErrorAction SilentlyContinue
+                Write-Log "Service redémarré: $($service.DisplayName) ($($service.Name))"
+            }
+        } catch {
+            Write-Warning "Impossible de redémarrer: $($service.DisplayName) - $($_.Exception.Message)"
+            Write-Log "ERREUR - Impossible de redémarrer: $($service.DisplayName) - $($_.Exception.Message)"
+        }
+    }
+}
+
+# Mode Capture (en mode sans échec)
+if ($Mode -eq "capture") {
+    Write-Host "=== MODE CAPTURE ===" -ForegroundColor Green
+    Write-Host "Capture des services en mode sans échec..." -ForegroundColor Yellow
+    
+    if ((Get-WmiObject -Class Win32_ComputerSystem).BootupState -notmatch "Safe") {
+        Write-Warning "ATTENTION: Il est recommandé d'exécuter ce mode en mode sans échec!"
+        $continue = Ask-User "Voulez-vous continuer quand même?"
+        if ($continue.ToString() -eq "STOP" -or $continue.ToString() -eq "False") {
+            Write-Host "Opération annulée." -ForegroundColor Red
+            return
+        }
+    }
+    
+    $safeModeServices = Get-RunningServices
+    $safeModeServices | ConvertTo-Json | Out-File $SafeModeServicesFile
+    Write-Log "Services capturés en mode sans échec: $($safeModeServices.Count)"
+    
+    Write-Host "Services capturés: $($safeModeServices.Count)" -ForegroundColor Green
+    Write-Host "Redémarrez en mode normal et exécutez le diagnostic interactif." -ForegroundColor Cyan
+}
+
+# Mode Interactif (diagnostic pas à pas)
+elseif ($Mode -eq "interactive") {
+    Write-Host "=== DIAGNOSTIC INTERACTIF ===" -ForegroundColor Green
+    Write-Log "Début du diagnostic interactif"
+    
+    # Vérification des fichiers de référence
+    if (!(Test-Path $SafeModeServicesFile)) {
+        Write-Host "Aucun fichier de référence trouvé." -ForegroundColor Yellow
+        $createReference = Ask-User "Voulez-vous créer une référence avec l'état actuel?"
+        
+        if ($createReference.ToString() -eq "STOP") { return }
+        
+        if ($createReference.ToString() -eq "True") {
+            Write-Host "Création de la référence..." -ForegroundColor Yellow
+            $currentServices = Get-RunningServices
+            
+            # Exclure les services Windows essentiels
+            $essentialServices = @(
+                "Winmgmt", "RpcSs", "DcomLaunch", "PlugPlay", "Power", "Themes", 
+                "AudioSrv", "AudioEndpointBuilder", "Dhcp", "Dnscache", "LanmanServer",
+                "LanmanWorkstation", "NlaSvc", "nsi", "WinHttpAutoProxySvc", "Spooler",
+                "EventLog", "Schedule", "ProfSvc", "UxSms", "SessionEnv", "TermService"
+            )
+            
+            $referenceServices = $currentServices | Where-Object {$_.Name -notin $essentialServices}
+            $referenceServices | ConvertTo-Json | Out-File $SafeModeServicesFile
+            Write-Log "Référence créée avec $($referenceServices.Count) services"
+            Write-Host "Référence créée avec $($referenceServices.Count) services" -ForegroundColor Green
+        } else {
+            Write-Host "Diagnostic annulé. Créez d'abord une référence." -ForegroundColor Red
+            return
+        }
+    }
+    
+    # Chargement des services de référence
+    $referenceServices = Get-Content $SafeModeServicesFile | ConvertFrom-Json
+    $currentServices = Get-RunningServices
+    
+    # Identification des services supplémentaires
+    $referenceNames = $referenceServices.Name
+    $additionalServices = $currentServices | Where-Object {$_.Name -notin $referenceNames}
+    
+    if ($additionalServices.Count -eq 0) {
+        Write-Host "Aucun service supplémentaire détecté!" -ForegroundColor Yellow
+        Write-Host "Le problème pourrait venir d'ailleurs (applications, pilotes, etc.)" -ForegroundColor Yellow
+        Write-Log "Aucun service supplémentaire détecté"
+        return
+    }
+    
+    Write-Host "`nServices supplémentaires détectés: $($additionalServices.Count)" -ForegroundColor Cyan
+    Write-Log "Services supplémentaires détectés: $($additionalServices.Count)"
+    
+    # Affichage de la liste complète
+    Write-Host "`nListe des services qui seront testés:" -ForegroundColor Yellow
+    $additionalServices | ForEach-Object {
+        Write-Host "  - $($_.DisplayName) ($($_.Name))" -ForegroundColor White
+    }
+    
+    # Confirmation pour commencer
+    $startDiagnostic = Ask-User "Voulez-vous commencer le diagnostic interactif?"
+    Write-Host "DEBUG: Valeur retournée = '$startDiagnostic' (Type: $($startDiagnostic.GetType().Name))" -ForegroundColor Magenta
+    
+    # Logique simplifiée
+    if ($startDiagnostic.ToString() -eq "STOP") {
+        Write-Host "Diagnostic annulé par STOP." -ForegroundColor Red
+        return
+    }
+    
+    if ($startDiagnostic.ToString() -eq "False") {
+        Write-Host "Diagnostic annulé par NON." -ForegroundColor Red
+        return
+    }
+    
+    # Si on arrive ici, c'est forcément True
+    Write-Host "DEBUG: Continuons le diagnostic..." -ForegroundColor Magenta
+    
+    # Test initial
+    Write-Host "`n=== TEST INITIAL ===" -ForegroundColor Green
+    Write-Host "Testez votre problème maintenant (upload lent, etc.)" -ForegroundColor Yellow
+    $initialProblem = Ask-User "Le problème est-il présent actuellement?"
+    
+    if ($initialProblem.ToString() -eq "STOP") { 
+        Write-Host "Diagnostic arrêté." -ForegroundColor Red
+        return 
+    }
+    
+    if ($initialProblem.ToString() -eq "False") {
+        Write-Host "Le problème n'est pas présent. Diagnostic non nécessaire." -ForegroundColor Green
+        Write-Log "Problème non présent lors du test initial"
+        return
+    }
+    
+    Write-Log "Problème confirmé lors du test initial"
+    
+    # Division en groupes
+    $serviceGroups = @()
+    for ($i = 0; $i -lt $additionalServices.Count; $i += $GroupSize) {
+        $group = $additionalServices[$i..([Math]::Min($i + $GroupSize - 1, $additionalServices.Count - 1))]
+        $serviceGroups += ,$group
+    }
+    
+    Write-Host "`nServices divisés en $($serviceGroups.Count) groupes de $GroupSize services maximum" -ForegroundColor Cyan
+    Write-Host "Pour cibler plus rapidement, les groupes sont volontairement larges (20 services)" -ForegroundColor Gray
+    Write-Log "Services divisés en $($serviceGroups.Count) groupes de $GroupSize services"
+    
+    # Diagnostic groupe par groupe
+    $allDisabledServices = @()
+    $problemFound = $false
+    
+    for ($groupIndex = 0; $groupIndex -lt $serviceGroups.Count; $groupIndex++) {
+        if ($problemFound) { break }
+        
+        $currentGroup = $serviceGroups[$groupIndex]
+        Show-ServiceGroup -Services $currentGroup -GroupNumber ($groupIndex + 1) -TotalGroups $serviceGroups.Count
+        
+        $continueWithGroup = Ask-User "Voulez-vous désactiver ce groupe?"
+        if ($continueWithGroup.ToString() -eq "STOP") { break }
+        
+        if ($continueWithGroup.ToString() -eq "True") {
+            Write-Host "`nDésactivation du groupe..." -ForegroundColor Yellow
+            $disabledInGroup = Disable-ServiceGroup -Services $currentGroup
+            $allDisabledServices += $disabledInGroup
+            
+            Write-Host "`nAttendez 3 secondes..." -ForegroundColor Gray
+            Start-Sleep -Seconds 3
+            
+            Write-Host "`n=== TEST APRÈS DÉSACTIVATION ===" -ForegroundColor Green
+            Write-Host "Testez maintenant votre problème (upload, etc.)" -ForegroundColor Yellow
+            $problemStillPresent = Ask-User "Le problème est-il toujours présent?"
+            
+            if ($problemStillPresent.ToString() -eq "STOP") { break }
+            
+            if ($problemStillPresent.ToString() -eq "False") {
+                Write-Host "`n🎉 PROBLÈME RÉSOLU! 🎉" -ForegroundColor Green
+                Write-Host "Le problème vient de l'un des services de ce groupe:" -ForegroundColor Yellow
+                
+                foreach ($service in $disabledInGroup) {
+                    Write-Host "  - $($service.DisplayName) ($($service.Name))" -ForegroundColor Red
+                }
+                
+                Write-Log "PROBLÈME TROUVÉ - Groupe $($groupIndex + 1): $($disabledInGroup.Count) services"
+                foreach ($service in $disabledInGroup) {
+                    Write-Log "SERVICE SUSPECT: $($service.DisplayName) ($($service.Name))"
+                }
+                
+                if ($disabledInGroup.Count -gt 1) {
+                    Write-Host "`nLe groupe contenait $($disabledInGroup.Count) services." -ForegroundColor Cyan
+                    Write-Host "Voulez-vous:" -ForegroundColor Yellow
+                    Write-Host "1. Tester individuellement chaque service (plus précis)" -ForegroundColor White
+                    Write-Host "2. Diviser le groupe en plus petits groupes (plus rapide)" -ForegroundColor White
+                    Write-Host "3. Laisser comme ça (tous ces services restent désactivés)" -ForegroundColor White
+                    
+                    do {
+                        $choice = Read-Host "Votre choix (1/2/3)"
+                    } while ($choice -notin @("1", "2", "3"))
+                    
+                    if ($choice -eq "1") {
+                        # Test individuel (code existant)
+                        Write-Host "`nRedémarrage de tous les services du groupe..." -ForegroundColor Yellow
+                        Enable-ServiceGroup -Services $disabledInGroup
+                        Start-Sleep -Seconds 2
+                        
+                        foreach ($service in $disabledInGroup) {
+                            Write-Host "`n--- Test individuel: $($service.DisplayName) ---" -ForegroundColor Cyan
+                            Write-Host "Désactivation de: $($service.DisplayName)" -ForegroundColor Yellow
+                            
+                            $singleDisabled = Disable-ServiceGroup -Services @($service)
+                            Start-Sleep -Seconds 2
+                            
+                            $individualTest = Ask-User "Le problème est-il résolu avec juste ce service désactivé?"
+                            if ($individualTest.ToString() -eq "STOP") { break }
+                            
+                            if ($individualTest.ToString() -eq "True") {
+                                Write-Host "`n🎯 COUPABLE TROUVÉ! 🎯" -ForegroundColor Red
+                                Write-Host "Service responsable: $($service.DisplayName) ($($service.Name))" -ForegroundColor Red
+                                Write-Log "COUPABLE IDENTIFIÉ: $($service.DisplayName) ($($service.Name))"
+                                $problemFound = $true
+                                break
+                            } else {
+                                Write-Host "Ce n'est pas ce service, redémarrage..." -ForegroundColor Gray
+                                Enable-ServiceGroup -Services @($service)
+                                Start-Sleep -Seconds 2
+                            }
+                        }
+                    }
+                    elseif ($choice -eq "2") {
+                        # Division en plus petits groupes
+                        Write-Host "`nDivision en groupes de 5 services..." -ForegroundColor Yellow
+                        Enable-ServiceGroup -Services $disabledInGroup
+                        Start-Sleep -Seconds 2
+                        
+                        $smallGroups = @()
+                        for ($i = 0; $i -lt $disabledInGroup.Count; $i += 5) {
+                            $smallGroup = $disabledInGroup[$i..([Math]::Min($i + 4, $disabledInGroup.Count - 1))]
+                            $smallGroups += ,$smallGroup
+                        }
+                        
+                        foreach ($smallGroupIndex in 0..($smallGroups.Count - 1)) {
+                            $smallGroup = $smallGroups[$smallGroupIndex]
+                            Write-Host "`n--- Sous-groupe $($smallGroupIndex + 1)/$($smallGroups.Count) ---" -ForegroundColor Cyan
+                            
+                            foreach ($service in $smallGroup) {
+                                Write-Host "  - $($service.DisplayName)" -ForegroundColor White
+                            }
+                            
+                            $testSmallGroup = Ask-User "Voulez-vous désactiver ce sous-groupe?"
+                            if ($testSmallGroup.ToString() -eq "STOP") { break }
+                            
+                            if ($testSmallGroup.ToString() -eq "True") {
+                                $disabledSmall = Disable-ServiceGroup -Services $smallGroup
+                                Start-Sleep -Seconds 2
+                                
+                                $testSmallResult = Ask-User "Le problème est-il résolu?"
+                                if ($testSmallResult.ToString() -eq "True") {
+                                    Write-Host "`n🎯 GROUPE COUPABLE TROUVÉ! 🎯" -ForegroundColor Red
+                                    Write-Host "Services responsables dans ce sous-groupe:" -ForegroundColor Red
+                                    foreach ($service in $disabledSmall) {
+                                        Write-Host "  - $($service.DisplayName) ($($service.Name))" -ForegroundColor Red
+                                        Write-Log "SERVICE SUSPECT: $($service.DisplayName) ($($service.Name))"
+                                    }
+                                    $problemFound = $true
+                                    break
+                                } else {
+                                    Enable-ServiceGroup -Services $disabledSmall
+                                    Start-Sleep -Seconds 1
+                                }
+                            }
+                        }
+                    }
+                    else {
+                        Write-Host "Tous les services du groupe restent désactivés." -ForegroundColor Yellow
+                    }
+                }
+                
+                $problemFound = $true
+            } else {
+                Write-Host "Le problème persiste, passage au groupe suivant..." -ForegroundColor Gray
+                Write-Log "Problème persiste après groupe $($groupIndex + 1)"
+            }
+        }
+    }
+    
+    if (-not $problemFound -and $allDisabledServices.Count -gt 0) {
+        Write-Host "`n⚠️ Le problème n'a pas été identifié dans les services testés." -ForegroundColor Yellow
+        Write-Host "Le problème pourrait venir d'applications de démarrage, pilotes, ou autre." -ForegroundColor Yellow
+        Write-Log "Problème non identifié dans les services testés"
+    }
+    
+    # Proposition de restauration
+    if ($allDisabledServices.Count -gt 0) {
+        Write-Host "`n=== RESTAURATION ===" -ForegroundColor Cyan
+        Write-Host "Services actuellement désactivés: $($allDisabledServices.Count)" -ForegroundColor White
+        
+        if (-not $problemFound) {
+            $restoreServices = Ask-User "Voulez-vous réactiver tous les services désactivés?"
+            if ($restoreServices.ToString() -eq "True") {
+                Write-Host "Réactivation de tous les services..." -ForegroundColor Yellow
+                Enable-ServiceGroup -Services $allDisabledServices
+                Write-Host "Services réactivés." -ForegroundColor Green
+                Write-Log "Tous les services ont été réactivés"
+            }
+        } else {
+            Write-Host "Les services responsables du problème restent désactivés." -ForegroundColor Yellow
+            Write-Host "Vous pouvez les réactiver manuellement via services.msc si nécessaire." -ForegroundColor Gray
+        }
+    }
+    
+    Write-Host "`nDiagnostic terminé! Log disponible dans: $DiagnosticLogFile" -ForegroundColor Green
+    Write-Log "Diagnostic terminé"
+}
+
+Write-Host "`nAppuyez sur Entrée pour fermer..." -ForegroundColor Gray
+Read-Host
