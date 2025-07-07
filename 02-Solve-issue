@@ -1,0 +1,351 @@
+# Script de gestion ciblée des services problématiques
+# Services identifiés comme causant des problèmes de performance réseau
+
+param(
+    [Parameter(Mandatory=$false)]
+    [ValidateSet("test", "disable", "enable", "status", "individual")]
+    [string]$Action = "test",
+    
+    [Parameter(Mandatory=$false)]
+    [string]$LogPath = "C:\Temp\ServiceDiagnostic"
+)
+
+# Vérification des privilèges administrateur
+if (-NOT ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
+    Write-Error "Ce script doit être exécuté en tant qu'administrateur!"
+    Write-Host "Clic droit sur PowerShell -> Exécuter en tant qu'administrateur" -ForegroundColor Yellow
+    Read-Host "Appuyez sur Entrée pour quitter"
+    exit
+}
+
+# Services problématiques identifiés
+$ProblemServices = @(
+    @{
+        Name = "Killer Network Service"
+        ServiceName = "Killer Network Service"
+        Description = "Service réseau Killer - SUSPECT PRINCIPAL pour les problèmes d'upload"
+        Critical = $false
+        Recommendation = "DÉSACTIVER - Utiliser les pilotes Intel génériques à la place"
+    },
+    @{
+        Name = "Serveur (LanmanServer)"
+        ServiceName = "LanmanServer"
+        Description = "Partage de fichiers et d'imprimantes Windows"
+        Critical = $true
+        Recommendation = "GARDER ACTIVÉ - Nécessaire pour le partage réseau"
+    },
+    @{
+        Name = "Service de géolocalisation"
+        ServiceName = "lfsvc"
+        Description = "Fournit les services de géolocalisation"
+        Critical = $false
+        Recommendation = "PEUT ÊTRE DÉSACTIVÉ - Seulement si vous n'utilisez pas la géolocalisation"
+    },
+    @{
+        Name = "Gestionnaire de licences Windows"
+        ServiceName = "LicenseManager"
+        Description = "Gestion des licences Windows Store"
+        Critical = $false
+        Recommendation = "PEUT ÊTRE DÉSACTIVÉ - Seulement si vous n'utilisez pas le Windows Store"
+    },
+    @{
+        Name = "Intel Management Service"
+        ServiceName = "LMS"
+        Description = "Service de gestion Intel AMT/vPro"
+        Critical = $false
+        Recommendation = "PEUT ÊTRE DÉSACTIVÉ - Seulement nécessaire pour la gestion d'entreprise"
+    }
+)
+
+$TargetedLogFile = "$LogPath\TargetedServiceLog.txt"
+
+# Création du dossier de logs
+if (!(Test-Path $LogPath)) {
+    New-Item -ItemType Directory -Path $LogPath -Force
+}
+
+# Fonction pour écrire dans le log
+function Write-Log {
+    param([string]$Message)
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    "$timestamp - $Message" | Out-File -FilePath $TargetedLogFile -Append
+    Write-Host $Message
+}
+
+# Fonction pour obtenir le statut d'un service
+function Get-ServiceStatus {
+    param([string]$ServiceName)
+    
+    try {
+        $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+        if ($service) {
+            return @{
+                Exists = $true
+                Status = $service.Status
+                StartType = $service.StartType
+            }
+        } else {
+            return @{
+                Exists = $false
+                Status = "NotFound"
+                StartType = "NotFound"
+            }
+        }
+    } catch {
+        return @{
+            Exists = $false
+            Status = "Error"
+            StartType = "Error"
+        }
+    }
+}
+
+# Fonction pour demander confirmation
+function Ask-User {
+    param([string]$Question)
+    
+    do {
+        Write-Host "`n$Question" -ForegroundColor Cyan
+        Write-Host "[O]ui / [N]on" -ForegroundColor Yellow
+        $response = Read-Host "Votre choix"
+        $response = $response.ToUpper().Trim()
+        
+        if ($response -eq "O" -or $response -eq "OUI") {
+            return $true
+        }
+        
+        if ($response -eq "N" -or $response -eq "NON") {
+            return $false
+        }
+        
+        Write-Host "Réponse non reconnue. Utilisez O/Oui ou N/Non" -ForegroundColor Red
+        
+    } while ($true)
+}
+
+# Fonction pour désactiver un service
+function Disable-TargetService {
+    param([string]$ServiceName, [string]$DisplayName)
+    
+    try {
+        $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+        if ($service) {
+            if ($service.Status -eq "Running") {
+                Write-Host "  Arrêt de $DisplayName..." -ForegroundColor Yellow
+                Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+            }
+            
+            # Désactiver le démarrage automatique
+            Set-Service -Name $ServiceName -StartupType Disabled -ErrorAction SilentlyContinue
+            Write-Host "  [OK] $DisplayName désactivé" -ForegroundColor Green
+            Write-Log "Service désactivé: $DisplayName ($ServiceName)"
+            return $true
+        } else {
+            Write-Host "  ! Service $DisplayName non trouvé" -ForegroundColor Gray
+            return $false
+        }
+    } catch {
+        Write-Host "  [ERREUR] Erreur lors de la désactivation de $DisplayName : $($_.Exception.Message)" -ForegroundColor Red
+        Write-Log "ERREUR - Désactivation de $DisplayName : $($_.Exception.Message)"
+        return $false
+    }
+}
+
+# Fonction pour réactiver un service
+function Enable-TargetService {
+    param([string]$ServiceName, [string]$DisplayName)
+    
+    try {
+        $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+        if ($service) {
+            Set-Service -Name $ServiceName -StartupType Automatic -ErrorAction SilentlyContinue
+            
+            Write-Host "  Démarrage de $DisplayName..." -ForegroundColor Yellow
+            Start-Service -Name $ServiceName -ErrorAction SilentlyContinue
+            
+            Write-Host "  [OK] $DisplayName réactivé" -ForegroundColor Green
+            Write-Log "Service réactivé: $DisplayName ($ServiceName)"
+            return $true
+        } else {
+            Write-Host "  ! Service $DisplayName non trouvé" -ForegroundColor Gray
+            return $false
+        }
+    } catch {
+        Write-Host "  [ERREUR] Erreur lors de la réactivation de $DisplayName : $($_.Exception.Message)" -ForegroundColor Red
+        Write-Log "ERREUR - Réactivation de $DisplayName : $($_.Exception.Message)"
+        return $false
+    }
+}
+
+# Logique principale selon l'action
+switch ($Action) {
+    "status" {
+        Write-Host "=== STATUT DES SERVICES PROBLÉMATIQUES ===" -ForegroundColor Green
+        Write-Log "Vérification du statut des services problématiques"
+        
+        foreach ($service in $ProblemServices) {
+            $status = Get-ServiceStatus -ServiceName $service.ServiceName
+            $statusColor = switch ($status.Status) {
+                "Running" { "Red" }
+                "Stopped" { "Green" }
+                "NotFound" { "Gray" }
+                default { "Yellow" }
+            }
+            
+            Write-Host "`n[INFO] $($service.Name)" -ForegroundColor Cyan
+            Write-Host "   Service: $($service.ServiceName)" -ForegroundColor White
+            Write-Host "   Statut: $($status.Status)" -ForegroundColor $statusColor
+            Write-Host "   Démarrage: $($status.StartType)" -ForegroundColor White
+            Write-Host "   Description: $($service.Description)" -ForegroundColor Gray
+            Write-Host "   Recommandation: $($service.Recommendation)" -ForegroundColor Yellow
+        }
+    }
+
+    "individual" {
+        Write-Host "=== TEST INDIVIDUEL DES SERVICES ===" -ForegroundColor Green
+        Write-Log "Début du test individuel des services problématiques"
+        
+        Write-Host "Ce test va désactiver chaque service un par un pour identifier le vrai coupable." -ForegroundColor Yellow
+        $proceed = Ask-User "Voulez-vous continuer?"
+        
+        if ($proceed) {
+            foreach ($service in $ProblemServices) {
+                $status = Get-ServiceStatus -ServiceName $service.ServiceName
+                
+                if ($status.Status -eq "Running") {
+                    Write-Host "`n[CIBLE] Test de: $($service.Name)" -ForegroundColor Cyan
+                    Write-Host "Description: $($service.Description)" -ForegroundColor Gray
+                    
+                    if ($service.Critical) {
+                        Write-Host "ATTENTION: Ce service est critique pour Windows!" -ForegroundColor Red
+                        $testCritical = Ask-User "Voulez-vous quand même le tester (déconseillé)?"
+                        if (-not $testCritical) {
+                            Write-Host "Service ignoré." -ForegroundColor Gray
+                            continue
+                        }
+                    }
+                    
+                    Write-Host "Désactivation temporaire..." -ForegroundColor Yellow
+                    Disable-TargetService -ServiceName $service.ServiceName -DisplayName $service.Name
+                    
+                    Write-Host "Attendez 3 secondes..." -ForegroundColor Gray
+                    Start-Sleep -Seconds 3
+                    
+                    $testResult = Ask-User "Le problème d'upload est-il résolu maintenant?"
+                    
+                    if ($testResult) {
+                        Write-Host "`n[TROUVE] COUPABLE TROUVÉ!" -ForegroundColor Red
+                        Write-Host "Service responsable: $($service.Name)" -ForegroundColor Red
+                        Write-Host "Recommandation: $($service.Recommendation)" -ForegroundColor Yellow
+                        Write-Log "COUPABLE FINAL IDENTIFIÉ: $($service.Name) ($($service.ServiceName))"
+                        
+                        $keepDisabled = Ask-User "Voulez-vous laisser ce service désactivé définitivement?"
+                        
+                        if (-not $keepDisabled) {
+                            Enable-TargetService -ServiceName $service.ServiceName -DisplayName $service.Name
+                        }
+                        
+                        Write-Host "`nDiagnostic terminé! Le coupable a été trouvé." -ForegroundColor Green
+                        break
+                    } else {
+                        Write-Host "Ce n'est pas ce service. Réactivation..." -ForegroundColor Gray
+                        Enable-TargetService -ServiceName $service.ServiceName -DisplayName $service.Name
+                        Start-Sleep -Seconds 2
+                    }
+                } else {
+                    Write-Host "`nService $($service.Name) - Déjà arrêté, test ignoré" -ForegroundColor Gray
+                }
+            }
+        }
+    }
+
+    "disable" {
+        Write-Host "=== DÉSACTIVATION DES SERVICES PROBLÉMATIQUES ===" -ForegroundColor Green
+        Write-Log "Désactivation des services problématiques"
+        
+        Write-Host "Services qui seront désactivés (recommandés seulement):" -ForegroundColor Yellow
+        $servicesToDisable = $ProblemServices | Where-Object { -not $_.Critical }
+        
+        foreach ($service in $servicesToDisable) {
+            Write-Host "  - $($service.Name): $($service.Recommendation)" -ForegroundColor White
+        }
+        
+        $proceed = Ask-User "Voulez-vous désactiver ces services?"
+        
+        if ($proceed) {
+            foreach ($service in $servicesToDisable) {
+                Disable-TargetService -ServiceName $service.ServiceName -DisplayName $service.Name
+            }
+            
+            Write-Host "`n[OK] Désactivation terminée!" -ForegroundColor Green
+            Write-Host "Testez maintenant votre problème d'upload." -ForegroundColor Yellow
+        }
+    }
+
+    "enable" {
+        Write-Host "=== RÉACTIVATION DE TOUS LES SERVICES ===" -ForegroundColor Green
+        Write-Log "Réactivation de tous les services problématiques"
+        
+        $proceed = Ask-User "Voulez-vous réactiver tous les services identifiés?"
+        
+        if ($proceed) {
+            foreach ($service in $ProblemServices) {
+                Enable-TargetService -ServiceName $service.ServiceName -DisplayName $service.Name
+            }
+            
+            Write-Host "`n[OK] Réactivation terminée!" -ForegroundColor Green
+        }
+    }
+
+    default {
+        Write-Host "=== TEST RAPIDE DES SERVICES PROBLÉMATIQUES ===" -ForegroundColor Green
+        Write-Log "Test rapide des services problématiques"
+        
+        Write-Host "Ce script va tester rapidement si le problème vient des services identifiés." -ForegroundColor Yellow
+        Write-Host "`nServices à tester:" -ForegroundColor Cyan
+        
+        foreach ($service in $ProblemServices) {
+            $status = Get-ServiceStatus -ServiceName $service.ServiceName
+            $statusText = if ($status.Status -eq "Running") { "[ACTIF]" } else { "[ARRETE]" }
+            Write-Host "  $statusText $($service.Name)" -ForegroundColor White
+        }
+        
+        Write-Host "`nOptions disponibles:" -ForegroundColor Yellow
+        Write-Host "1. Test individuel (recommandé) - Trouve le vrai coupable" -ForegroundColor White
+        Write-Host "2. Désactiver les services non-critiques - Solution rapide" -ForegroundColor White
+        Write-Host "3. Afficher le statut détaillé - Information seulement" -ForegroundColor White
+        Write-Host "4. Réactiver tout - Restauration complète" -ForegroundColor White
+        
+        do {
+            $choice = Read-Host "`nVotre choix (1-4)"
+        } while ($choice -notin @("1", "2", "3", "4"))
+        
+        switch ($choice) {
+            "1" { 
+                Write-Host "`nLancement du test individuel..." -ForegroundColor Green
+                & $MyInvocation.MyCommand.Path -Action individual
+            }
+            "2" { 
+                Write-Host "`nLancement de la désactivation..." -ForegroundColor Green
+                & $MyInvocation.MyCommand.Path -Action disable
+            }
+            "3" { 
+                Write-Host "`nAffichage du statut..." -ForegroundColor Green
+                & $MyInvocation.MyCommand.Path -Action status
+            }
+            "4" { 
+                Write-Host "`nLancement de la réactivation..." -ForegroundColor Green
+                & $MyInvocation.MyCommand.Path -Action enable
+            }
+        }
+    }
+}
+
+Write-Host "`n=== RÉSUMÉ DES RECOMMANDATIONS ===" -ForegroundColor Cyan
+Write-Host "[CIBLE] SUSPECT PRINCIPAL: Killer Network Service" -ForegroundColor Red
+Write-Host "   -> Désinstallez complètement le logiciel Killer" -ForegroundColor Yellow
+Write-Host "   -> Utilisez les pilotes Intel génériques" -ForegroundColor Yellow
+Write-Host "`n[INFO] Autres services peuvent être désactivés si non utilisés" -ForegroundColor Green
+Write-Host "`nLog disponible: $TargetedLogFile" -ForegroundColor Gray
+Write-Host "`nAppuyez sur Entrée pour fermer..." -ForegroundColor Gray
+Read-Host
