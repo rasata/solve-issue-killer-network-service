@@ -9,8 +9,8 @@ This tool was developed to diagnose and resolve network upload performance issue
 ## 📁 Repository Contents
 
 ```
-├── diagnostic-script.ps1          # Main diagnostic script (interactive service testing)
-├── targeted-service-manager.ps1   # Targeted management of identified problem services
+├── 01-diagnose.ps1       # Main diagnostic script (interactive service testing)
+├── 02-Solve-issuer.ps1   # Targeted management of identified problem services
 └── README.md                      # This documentation
 ```
 
@@ -38,10 +38,10 @@ Right-click on PowerShell → "Run as Administrator"
 3. **Execute the main diagnostic:**
 ```powershell
 # Interactive diagnosis (recommended for first-time users)
-.\diagnostic-script.ps1
+.\01-diagnose.ps1 
 
 # Quick targeted test for known problem services
-.\targeted-service-manager.ps1 -Action individual
+.\02-Solve-issuer.ps -Action individual
 ```
 
 ## 📋 Scripts Overview
